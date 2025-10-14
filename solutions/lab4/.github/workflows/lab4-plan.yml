@@ -1,0 +1,201 @@
+name: "Lab 4 Terraform Plan (PR)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "solutions/lab4/**/*.tf"
+      - "solutions/lab4/**/*.tfvars"
+      - ".github/workflows/lab4-plan.yml"
+      - ".github/workflows/lab4-apply.yml"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        env: [staging, production]
+    environment: ${{ matrix.env }}
+    defaults:
+      run:
+        working-directory: solutions/lab4
+
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_USE_OIDC: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="resource_group_name=${{secrets.TFSTATE_RESOURCE_GROUP_NAME}}" -backend-config="storage_account_name=${{secrets.TFSTATE_STORAGE_ACCOUNT_NAME}}" -backend-config="container_name=${{secrets.TFSTATE_CONTAINER_NAME}}"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var-file="${{ matrix.env }}.tfvars" \
+            -out="${{ matrix.env }}.tfplan" \
+            -detailed-exitcode
+          exitcode=$?
+          echo "plan_exitcode=$exitcode" >> $GITHUB_OUTPUT
+          if [ $exitcode -eq 1 ]; then
+            echo "Terraform plan failed."
+            exit 1
+          fi
+          echo "Terraform plan exit code: $exitcode (0=no changes, 2=changes)"
+        continue-on-error: false
+
+      - name: Generate Plan Summary
+        id: summary
+        run: |
+          set -e
+          terraform show -no-color ${{ matrix.env }}.tfplan > plan_output.txt
+          ls -l plan_output.txt || true
+          PLAN_EXITCODE="${{ steps.plan.outputs.plan_exitcode }}"
+          if [ "$PLAN_EXITCODE" = "0" ]; then
+            PLAN_STATUS_TEXT="✅ No changes"
+          elif [ "$PLAN_EXITCODE" = "2" ]; then
+            PLAN_STATUS_TEXT="🟡 Changes detected"
+          else
+            PLAN_STATUS_TEXT="❌ Error"
+          fi
+          CHANGES_LINE=$(grep -E "(Plan:|No changes)" plan_output.txt || echo "Plan result line not found")
+          FILE="plan_summary_${{ matrix.env }}.md"
+          {
+            echo "## 🏗️ Terraform Plan: ${{ matrix.env }}"
+            echo ""
+            echo "**Status:** $PLAN_STATUS_TEXT"
+            echo "**Exit Code:** $PLAN_EXITCODE"
+            echo "**Summary:** $CHANGES_LINE"
+            echo ""
+            echo "<details>"
+            echo "<summary>📋 Show Plan Details</summary>"
+            echo ""
+            echo '```hcl'
+            if [ -s plan_output.txt ]; then
+              cat plan_output.txt
+            else
+              echo "# plan_output.txt missing or empty"
+            fi
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "---"
+          } > "$FILE"
+          echo "Generated $FILE (size: $(stat -c%s "$FILE" 2>/dev/null || echo 0) bytes)"
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-plan-${{ matrix.env }}
+          path: |
+            solutions/lab4/${{ matrix.env }}.tfplan
+            solutions/lab4/plan_output.txt
+            solutions/lab4/plan_summary_${{ matrix.env }}.md
+          retention-days: 30
+
+  comment:
+    name: "Comment PR"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: always() && github.event_name == 'pull_request'
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Plan Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: terraform-plan-*
+          merge-multiple: true
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read plan summaries
+            let comment = '# 🔄 Terraform Plan Results\n\n';
+            comment += `**PR:** #${{ github.event.number }}\n`;
+            comment += `**Commit:** ${{ github.event.pull_request.head.sha }}\n`;
+            comment += `**Author:** @${{ github.event.pull_request.user.login }}\n\n`;
+
+            const environments = ['staging', 'production'];
+
+            for (const env of environments) {
+              try {
+                const summary = fs.readFileSync(`plan_summary_${env}.md`, 'utf8');
+                comment += summary + '\n';
+              } catch (error) {
+                comment += `## ❌ ${env}\nFailed to generate plan\n\n`;
+              }
+            }
+
+            comment += '\n---\n';
+            comment += '**Note:** Plans are generated for both staging and production environments.\n';
+            comment += 'Review carefully before merging this PR.\n';
+
+            // Update or create comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(comment => 
+              comment.body.includes('🔄 Terraform Plan Results')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }

@@ -1,0 +1,156 @@
+name: "Lab 4 Terraform Destroy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy (all|staging|production)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - staging
+          - production
+      confirm:
+        description: "Type DESTROY to confirm"
+        required: true
+        default: ""
+
+concurrency:
+  group: terraform-destroy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  destroy-staging:
+    name: "Destroy Staging"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.environment == 'staging' || github.event.inputs.environment == 'all' }}
+    environment: staging
+    defaults:
+      run:
+        working-directory: solutions/lab4
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Safety Check
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "Confirmation text mismatch. Aborting."
+            exit 1
+          fi
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Terraform Init
+        run: terraform init -backend-config="resource_group_name=${{secrets.TFSTATE_RESOURCE_GROUP_NAME}}" -backend-config="storage_account_name=${{secrets.TFSTATE_STORAGE_ACCOUNT_NAME}}" -backend-config="container_name=${{secrets.TFSTATE_CONTAINER_NAME}}"
+      - name: Terraform Destroy Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -destroy -var-file="staging.tfvars" -out="staging-destroy.tfplan" -detailed-exitcode
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "Destroy plan failed"
+            exit 1
+          fi
+          echo "plan_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "No resources to destroy in staging."
+          else
+            echo "Resources scheduled for destruction (exit code 2)."
+          fi
+          set -e
+      - name: Terraform Destroy Apply
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: terraform apply -auto-approve staging-destroy.tfplan
+      - name: Pull Final State (Post-Destroy)
+        run: terraform state pull > post-destroy-staging.tfstate || echo "{}" > post-destroy-staging.tfstate
+      - name: Upload Destroy Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-destroy
+          path: |
+            solutions/lab4/staging-destroy.tfplan
+            solutions/lab4/post-destroy-staging.tfstate
+          retention-days: 7
+
+  destroy-production:
+    name: "Destroy Production"
+    runs-on: ubuntu-latest
+    needs: [destroy-staging]
+    if: ${{ (github.event.inputs.environment == 'production' || github.event.inputs.environment == 'all') && (github.event.inputs.environment != 'all' || needs.destroy-staging.result == 'success') }}
+    environment: production
+    defaults:
+      run:
+        working-directory: solutions/lab4
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Safety Check
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "Confirmation text mismatch. Aborting."
+            exit 1
+          fi
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Terraform Init
+        run: terraform init -backend-config="resource_group_name=${{secrets.TFSTATE_RESOURCE_GROUP_NAME}}" -backend-config="storage_account_name=${{secrets.TFSTATE_STORAGE_ACCOUNT_NAME}}" -backend-config="container_name=${{secrets.TFSTATE_CONTAINER_NAME}}"
+      - name: Terraform Destroy Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -destroy -var-file="production.tfvars" -out="production-destroy.tfplan" -detailed-exitcode
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "Destroy plan failed"
+            exit 1
+          fi
+          echo "plan_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "No resources to destroy in production."
+          else
+            echo "Resources scheduled for destruction (exit code 2)."
+          fi
+          set -e
+      - name: Terraform Destroy Apply
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: terraform apply -auto-approve production-destroy.tfplan
+      - name: Pull Final State (Post-Destroy)
+        run: terraform state pull > post-destroy-production.tfstate || echo "{}" > post-destroy-production.tfstate
+      - name: Upload Destroy Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-destroy
+          path: |
+            solutions/lab4/production-destroy.tfplan
+            solutions/lab4/post-destroy-production.tfstate
+          retention-days: 7

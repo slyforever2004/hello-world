@@ -1,0 +1,170 @@
+#cloud-config
+
+# Cloud-init configuration for VM initialization
+# This script runs during the first boot of the VM
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - nginx
+  - curl
+  - wget
+  - git
+  - htop
+  - tree
+  - jq
+  - unzip
+
+# Create a simple web application
+write_files:
+  - content: |
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Terraform CI/CD Lab - ${environment}</title>
+          <style>
+              body {
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                  margin: 0;
+                  padding: 20px;
+                  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                  color: white;
+                  min-height: 100vh;
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+              }
+              .container {
+                  background: rgba(255, 255, 255, 0.1);
+                  padding: 40px;
+                  border-radius: 15px;
+                  backdrop-filter: blur(10px);
+                  box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+                  border: 1px solid rgba(255, 255, 255, 0.18);
+                  text-align: center;
+                  max-width: 600px;
+              }
+              h1 {
+                  margin-bottom: 20px;
+                  font-size: 2.5em;
+              }
+              .environment {
+                  font-size: 1.5em;
+                  font-weight: bold;
+                  color: #ffd700;
+                  text-transform: uppercase;
+                  margin: 20px 0;
+              }
+              .info {
+                  background: rgba(255, 255, 255, 0.1);
+                  padding: 20px;
+                  border-radius: 10px;
+                  margin: 20px 0;
+                  text-align: left;
+              }
+              .hostname {
+                  color: #90EE90;
+                  font-family: monospace;
+              }
+              .status {
+                  color: #98FB98;
+                  font-weight: bold;
+              }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <h1>🚀 Terraform CI/CD Lab</h1>
+              <div class="environment">${environment} Environment</div>
+              <div class="info">
+                  <p><strong>Hostname:</strong> <span class="hostname">${hostname}</span></p>
+                  <p><strong>Status:</strong> <span class="status">✅ Deployed Successfully</span></p>
+                  <p><strong>Deployment:</strong> GitHub Actions + Terraform</p>
+                  <p><strong>Cloud:</strong> Microsoft Azure</p>
+                  <p><strong>Last Updated:</strong> <span id="timestamp"></span></p>
+              </div>
+              <p>This application was deployed using Infrastructure as Code (IaC) with Terraform and GitHub Actions CI/CD pipeline.</p>
+          </div>
+          
+          <script>
+              document.getElementById('timestamp').textContent = new Date().toLocaleString();
+          </script>
+      </body>
+      </html>
+    path: /var/www/html/index.html
+    permissions: '0644'
+
+  - content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          
+          root /var/www/html;
+          index index.html index.htm index.nginx-debian.html;
+          
+          server_name _;
+          
+          location / {
+              try_files $uri $uri/ =404;
+          }
+          
+          location /health {
+              access_log off;
+              return 200 "healthy\n";
+              add_header Content-Type text/plain;
+          }
+          
+          location /info {
+              access_log off;
+              return 200 '{"environment": "${environment}", "hostname": "${hostname}", "status": "running", "timestamp": "$time_iso8601"}';
+              add_header Content-Type application/json;
+          }
+      }
+    path: /etc/nginx/sites-available/default
+    permissions: '0644'
+
+  - content: |
+      #!/bin/bash
+      # System information script
+      echo "=== VM Information ==="
+      echo "Hostname: $(hostname)"
+      echo "Environment: ${environment}"
+      echo "Uptime: $(uptime)"
+      echo "Memory: $(free -h | grep Mem)"
+      echo "Disk: $(df -h / | tail -1)"
+      echo "IP Address: $(curl -s ifconfig.me 2>/dev/null || echo 'Unable to determine')"
+      echo "=== End Information ==="
+    path: /usr/local/bin/vm-info
+    permissions: '0755'
+
+# Configure services
+runcmd:
+  - systemctl enable nginx
+  - systemctl start nginx
+  - systemctl status nginx
+  - echo "Cloud-init configuration completed for ${environment} environment" > /var/log/cloud-init-complete.log
+  - echo "Hostname: ${hostname}" >> /var/log/cloud-init-complete.log
+  - date >> /var/log/cloud-init-complete.log
+
+# Set hostname
+hostname: ${hostname}
+
+# Configure system settings
+timezone: Asia/Singapore
+
+# Configure automatic security updates
+package_reboot_if_required: true
+
+# Final message
+final_message: |
+  Cloud-init has finished configuring the VM.
+  Environment: ${environment}
+  Hostname: ${hostname}
+  
+  The web server is now running on port 80.
+  You can access the application at: http://VM_PUBLIC_IP/
+  
+  For system information, run: /usr/local/bin/vm-info

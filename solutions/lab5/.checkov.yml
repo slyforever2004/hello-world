@@ -1,0 +1,20 @@
+---
+# Configuration for Checkov security scanning
+framework: terraform
+
+# Quiet mode - only output failed checks
+quiet: true
+
+
+# Skip checks (add check IDs to skip specific security rules)
+skip-check: []          # Add rule IDs to skip if needed
+
+# Custom policies directory (if you have custom policies)
+# external-checks-dir: ./custom-policies
+
+# Compact output format
+compact: true
+# Custom policies directory (if you have custom policies)
+# external-checks-dir: ./custom-policies
+
+enable-secret-scan-all-files: true

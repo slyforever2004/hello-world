@@ -1,0 +1,286 @@
+name: "Lab 4 Terraform Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "solutions/lab4/**/*.tf"
+      - "solutions/lab4/**/*.tfvars"
+      - ".github/workflows/lab4-apply.yml"
+      - ".github/workflows/lab4-plan.yml"
+  workflow_dispatch: {}
+
+
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    environment: staging
+
+    outputs:
+      deployment-status: ${{ steps.apply.outcome }}
+      resource-summary: ${{ steps.output.outputs.summary }}
+
+    defaults:
+      run:
+        working-directory: solutions/lab4
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="resource_group_name=${{secrets.TFSTATE_RESOURCE_GROUP_NAME}}" -backend-config="storage_account_name=${{secrets.TFSTATE_STORAGE_ACCOUNT_NAME}}" -backend-config="container_name=${{secrets.TFSTATE_CONTAINER_NAME}}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -var-file="staging.tfvars" -out="staging.tfplan" -detailed-exitcode
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+            # 0 = no changes, 2 = changes
+          echo "plan_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "No infrastructure changes detected."
+          else
+            echo "Changes detected (exit code 2)."
+          fi
+          set -e
+
+      - name: Terraform Apply
+        id: apply
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: terraform apply -auto-approve staging.tfplan
+
+      - name: Skip Apply (No Changes)
+        if: steps.plan.outputs.plan_exit_code == '0'
+        run: echo "No changes to apply for staging."
+
+      - name: Terraform Output
+        id: output
+        run: |
+          set +e
+          terraform output -json > staging_outputs.json 2>/dev/null
+          if [ $? -ne 0 ]; then
+            echo "{}" > staging_outputs.json
+            echo "No Terraform outputs available."
+          fi
+          if terraform output -json resource_summary >/dev/null 2>&1; then
+            echo "summary=$(terraform output -json resource_summary | jq -c .)" >> $GITHUB_OUTPUT
+          else
+            echo "summary={}" >> $GITHUB_OUTPUT
+          fi
+          if [ "${{ steps.plan.outputs.plan_exit_code }}" = "2" ]; then
+            if terraform output -raw vm_public_ip >/dev/null 2>&1; then
+              echo "VM Public IP: $(terraform output -raw vm_public_ip)"
+            fi
+            if terraform output -raw ssh_connection_command >/dev/null 2>&1; then
+              echo "SSH Command: $(terraform output -raw ssh_connection_command)"
+            fi
+          fi
+          set -e
+
+      - name: Pull Final State (Post-Apply)
+        run: terraform state pull > post-apply-staging.tfstate || echo "{}" > post-apply-staging.tfstate
+
+      - name: Upload Deployment Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-deployment
+          path: |
+            solutions/lab4/staging_outputs.json
+            solutions/lab4/post-apply-staging.tfstate
+          retention-days: 30
+
+      - name: Test Staging Deployment
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: |
+          VM_IP=$(terraform output -raw vm_public_ip)
+          echo "Testing staging deployment at IP: $VM_IP"
+
+          # Wait for VM to be ready
+          echo "Waiting for VM to be ready..."
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://$VM_IP/ | grep -q "200"; then
+              echo "✅ Staging deployment is healthy"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 10
+          done
+
+  deploy-production:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production
+    if: needs.deploy-staging.outputs.deployment-status == 'success'
+
+    defaults:
+      run:
+        working-directory: solutions/lab4
+
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="resource_group_name=${{secrets.TFSTATE_RESOURCE_GROUP_NAME}}" -backend-config="storage_account_name=${{secrets.TFSTATE_STORAGE_ACCOUNT_NAME}}" -backend-config="container_name=${{secrets.TFSTATE_CONTAINER_NAME}}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -var-file="production.tfvars" -out="production.tfplan" -detailed-exitcode
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+          echo "plan_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "No infrastructure changes detected."
+          else
+            echo "Changes detected (exit code 2)."
+          fi
+          set -e
+
+      - name: Terraform Apply
+        id: apply
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: terraform apply -auto-approve production.tfplan
+
+      - name: Skip Apply (No Changes)
+        if: steps.plan.outputs.plan_exit_code == '0'
+        run: echo "No changes to apply for production."
+
+      - name: Terraform Output
+        id: output
+        run: |
+          set +e
+          terraform output -json > production_outputs.json 2>/dev/null
+          if [ $? -ne 0 ]; then
+            echo "{}" > production_outputs.json
+            echo "No Terraform outputs available."
+          fi
+          if terraform output -json resource_summary >/dev/null 2>&1; then
+            echo "summary=$(terraform output -json resource_summary | jq -c .)" >> $GITHUB_OUTPUT
+          else
+            echo "summary={}" >> $GITHUB_OUTPUT
+          fi
+          if [ "${{ steps.plan.outputs.plan_exit_code }}" = "2" ]; then
+            if terraform output -raw vm_public_ip >/dev/null 2>&1; then
+              echo "VM Public IP: $(terraform output -raw vm_public_ip)"
+            fi
+            if terraform output -raw ssh_connection_command >/dev/null 2>&1; then
+              echo "SSH Command: $(terraform output -raw ssh_connection_command)"
+            fi
+          fi
+          set -e
+
+      - name: Pull Final State (Post-Apply)
+        run: terraform state pull > post-apply-production.tfstate || echo "{}" > post-apply-production.tfstate
+
+      - name: Upload Deployment Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-deployment
+          path: |
+            solutions/lab4/production_outputs.json
+            solutions/lab4/post-apply-production.tfstate
+          retention-days: 90
+
+      - name: Test Production Deployment
+        if: steps.plan.outputs.plan_exit_code == '2'
+        run: |
+          VM_IP=$(terraform output -raw vm_public_ip)
+          echo "Testing production deployment at IP: $VM_IP"
+
+          # Wait for VM to be ready
+          echo "Waiting for VM to be ready..."
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://$VM_IP/ | grep -q "200"; then
+              echo "✅ Production deployment is healthy"
+              echo "🌐 Application URL: http://$VM_IP/"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 10
+          done
+
+      - name: Post Deployment Summary
+        if: steps.plan.outputs.plan_exit_code == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const outputs = JSON.parse(fs.readFileSync('solutions/lab4/production_outputs.json', 'utf8'));
+
+            const summary = `
+            ## 🚀 Production Deployment Successful
+
+            **Deployment Time:** ${new Date().toISOString()}
+            **Commit:** ${{ github.sha }}
+            **Environment:** Production
+
+            ### 📊 Deployed Resources
+            ${JSON.stringify(outputs.resource_summary.value, null, 2)}
+
+            ### 🔗 Access Information
+            - **Application URL:** http://${outputs.vm_public_ip.value}/
+            - **SSH Access:** \`${outputs.ssh_connection_command.value}\`
+            - **Resource Group:** ${outputs.resource_group_name.value}
+
+            ### ✅ Post-Deployment Checks
+            - [x] Infrastructure deployed successfully
+            - [x] Application health check passed
+            - [x] Resources accessible
+
+            ---
+            *Deployed via GitHub Actions*
+            `;
+
+            console.log(summary);

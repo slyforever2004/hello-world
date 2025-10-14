@@ -1,0 +1,195 @@
+name: "Lab 5 Terraform Quality Gate & Integration Tests"
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "solutions/lab5/**"
+      - ".github/workflows/lab5-ci.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TF_VERSION: "1.7.0"
+  TFLINT_VERSION: "v0.50.3"
+  CHECKOV_VERSION: "3.1.34"
+  GO_VERSION: "1.21"
+  CHECKOV_SEVERITY_THRESHOLD: "MEDIUM"
+
+jobs:
+  # Code quality and security checks
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: solutions/lab5
+
+      - name: Terraform Init (modules)
+        run: terraform init
+        working-directory: solutions/lab5/modules/web_app
+
+      - name: Terraform Init (examples)
+        run: terraform init
+        working-directory: solutions/lab5/examples/basic
+
+      - name: Terraform Validate (modules)
+        run: terraform validate
+        working-directory: solutions/lab5/modules/web_app
+
+      - name: Terraform Validate (examples)
+        run: terraform validate
+        working-directory: solutions/lab5/examples/basic
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Init TFLint
+        run: tflint --init
+
+      - name: Run TFLint on modules
+        run: tflint --format compact
+        working-directory: solutions/lab5/modules/web_app
+
+      - name: Run TFLint on examples
+        run: tflint --format compact
+        working-directory: solutions/lab5/examples/basic
+
+      - name: Run TFLint on tflint-fails (expected to fail; non-blocking)
+        run: tflint --format compact
+        working-directory: solutions/lab5/tflint-fails
+        continue-on-error: true
+
+      - name: Install Checkov
+        run: pip install checkov==${{ env.CHECKOV_VERSION }}
+      - name: Prepare reports directory
+        run: mkdir -p reports
+        working-directory: solutions/lab5
+      - name: Run Checkov security scan
+        run: |
+          CHECKOV_EXIT=0
+          checkov \
+            --config-file .checkov.yml \
+            -d . \
+            -o junitxml -o sarif \
+            --output-file-path reports || CHECKOV_EXIT=$?
+          echo "CHECKOV_EXIT=$CHECKOV_EXIT" >> $GITHUB_ENV
+        continue-on-error: true
+        working-directory: solutions/lab5
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-results
+          path: |
+            solutions/lab5/reports/results_junitxml.xml
+            solutions/lab5/reports/results_sarif.sarif
+          retention-days: 30
+      - name: Checkov Summary
+        if: always()
+        run: |
+          sudo apt-get update -y >/dev/null 2>&1 && sudo apt-get install -y jq >/dev/null 2>&1
+          echo "### Checkov Summary" >> $GITHUB_STEP_SUMMARY
+          if [ -f reports/results_sarif.sarif ]; then
+            jq -r '.runs[].results[]?.properties.severity' reports/results_sarif.sarif | sort | uniq -c > sev_counts.txt || true
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Severity counts:" >> $GITHUB_STEP_SUMMARY
+            while read -r line; do
+              COUNT=$(echo "$line" | awk '{print $1}')
+              SEV=$(echo "$line" | awk '{print $2}')
+              [ -z "$SEV" ] && continue
+              echo "- $SEV: $COUNT" >> $GITHUB_STEP_SUMMARY
+            done < sev_counts.txt
+            TOTAL_FAILS=$(jq '[.runs[].results[]? | select(.level=="error" or .level=="warning")] | length' reports/results_sarif.sarif)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Total findings (error+warning): $TOTAL_FAILS" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "Raw exit code: ${CHECKOV_EXIT:-0}" >> $GITHUB_STEP_SUMMARY
+        working-directory: solutions/lab5
+      - name: Enforce Checkov severity threshold
+        if: always()
+        run: |
+          sudo apt-get update -y >/dev/null 2>&1 && sudo apt-get install -y jq >/dev/null 2>&1
+          THRESHOLD="${CHECKOV_SEVERITY_THRESHOLD}"
+          [ -f reports/results_sarif.sarif ] || { echo "No SARIF results; failing."; exit 1; }
+          sev_rank() {
+            case "$1" in
+              LOW) echo 1 ;;
+              MEDIUM) echo 2 ;;
+              HIGH) echo 3 ;;
+              CRITICAL) echo 4 ;;
+              *) echo 0 ;;
+            esac
+          }
+          THRESHOLD_RANK=$(sev_rank "$THRESHOLD")
+          VIOLATIONS=$(jq -r '.runs[].results[]?.properties.severity' reports/results_sarif.sarif || true)
+          FAIL=0
+          while read -r S; do
+            [ -z "$S" ] && continue
+            [ "$(sev_rank "$S")" -ge "$THRESHOLD_RANK" ] && FAIL=1 && break
+          done <<< "$VIOLATIONS"
+          if [ "$FAIL" -eq 1 ]; then
+            echo "At least one failed check meets/exceeds threshold ($THRESHOLD). Failing."
+            exit 1
+          else
+            echo "No failed checks at or above threshold ($THRESHOLD). Passing."
+          fi
+        working-directory: solutions/lab5
+
+  # Terratest integration tests
+  terratest:
+    name: Terratest
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: development
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_USE_OIDC: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Tidy Go modules
+        run: go mod tidy
+        working-directory: solutions/lab5/tests
+
+      - name: Download Go modules
+        run: go mod download
+        working-directory: solutions/lab5/tests
+
+      - name: Run Terratest
+        run: go test -v -timeout 30m
+        working-directory: solutions/lab5/tests

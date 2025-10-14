@@ -1,0 +1,87 @@
+{
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.Compute/virtualMachines"
+      },
+      {
+        "field": "Microsoft.Compute/virtualMachines/storageProfile.osDisk.osType",
+        "like": "Linux*"
+      }
+    ]
+  },
+  "then": {
+    "effect": "deployIfNotExists",
+    "details": {
+      "type": "Microsoft.Compute/virtualMachines/extensions",
+      "roleDefinitionIds": [
+        "/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c"
+      ],
+      "existenceCondition": {
+        "allOf": [
+          {
+            "field": "Microsoft.Compute/virtualMachines/extensions/type",
+            "equals": "AzureMonitorLinuxAgent"
+          },
+          {
+            "field": "Microsoft.Compute/virtualMachines/extensions/publisher",
+            "equals": "Microsoft.Azure.Monitor"
+          },
+          {
+            "field": "Microsoft.Compute/virtualMachines/extensions/provisioningState",
+            "equals": "Succeeded"
+          }
+        ]
+      },
+      "deployment": {
+        "properties": {
+          "mode": "incremental",
+          "template": {
+            "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+              "vmName": {
+                "type": "string"
+              },
+              "vmLocation": {
+                "type": "string"
+              },
+              "logAnalyticsWorkspaceId": {
+                "type": "string"
+              }
+            },
+            "resources": [
+              {
+                "type": "Microsoft.Compute/virtualMachines/extensions",
+                "name": "[concat(parameters('vmName'), '/AzureMonitorLinuxAgent')]",
+                "apiVersion": "2021-11-01",
+                "location": "[parameters('vmLocation')]",
+                "properties": {
+                  "publisher": "Microsoft.Azure.Monitor",
+                  "type": "AzureMonitorLinuxAgent",
+                  "typeHandlerVersion": "1.0",
+                  "autoUpgradeMinorVersion": true,
+                  "settings": {
+                    "workspaceId": "[parameters('logAnalyticsWorkspaceId')]"
+                  }
+                }
+              }
+            ]
+          },
+          "parameters": {
+            "vmName": {
+              "value": "[field('name')]"
+            },
+            "vmLocation": {
+              "value": "[field('location')]"
+            },
+            "logAnalyticsWorkspaceId": {
+              "value": "[parameters('logAnalyticsWorkspaceId')]"
+            }
+          }
+        }
+      }
+    }
+  }
+}
