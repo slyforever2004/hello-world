@@ -14,7 +14,7 @@ variable "tags" {
   description = "Common resource tags"
   type        = map(string)
   default = {
-    Project = "lab7"
+    Project = "lab7-test"
     Owner   = "platform-team"
     Team    = "platform-team"
     BU      = "ETS111"
