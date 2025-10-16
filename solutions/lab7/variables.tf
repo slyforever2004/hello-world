@@ -17,7 +17,7 @@ variable "tags" {
     Project = "lab7-test"
     Owner   = "platform-team"
     Team    = "platform-team"
-    BU      = "ETS111"
+    project      = "project"
   }
 }
 
